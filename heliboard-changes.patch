@@ -1,0 +1,1849 @@
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/AndroidManifest.xml HeliBoard-main/app/src/main/AndroidManifest.xml
+--- HeliBoard-orig/app/src/main/AndroidManifest.xml	2026-11-08 13:40:07.605338846 -0300
++++ HeliBoard-main/app/src/main/AndroidManifest.xml	2026-11-08 16:35:10.792727032 -0300
+@@ -13,6 +13,8 @@
+     <uses-permission android:name="android.permission.VIBRATE" />
+     <uses-permission android:name="android.permission.WRITE_USER_DICTIONARY" />
+     <uses-permission android:name="android.permission.READ_CONTACTS" />
++    <!-- for the built-in voice input panel -->
++    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+ 
+     <application android:label="@string/english_ime_name"
+             android:name="helium314.keyboard.latin.App"
+@@ -90,6 +92,10 @@
+             android:theme="@style/TransparentActivityTheme" android:excludeFromRecents="true" android:noHistory="true"
+             android:windowSoftInputMode="adjustResize|stateAlwaysVisible" android:configChanges="orientation|screenSize"/>
+ 
++        <!-- asks for the microphone permission, an input method can't do that itself -->
++        <activity android:name="helium314.keyboard.latin.voice.VoicePermissionActivity" android:exported="false"
++            android:theme="@style/TransparentActivityTheme" android:excludeFromRecents="true" android:noHistory="true"/>
++
+         <!-- Broadcast receivers -->
+         <receiver android:name="SystemBroadcastReceiver"
+                 android:exported="true">
+@@ -138,5 +144,10 @@
+             <action android:name="android.intent.action.MAIN" />
+             <category android:name="android.intent.category.LAUNCHER" />
+         </intent>
++
++        <!-- To find the speech recognition service for the built-in voice input -->
++        <intent>
++            <action android:name="android.speech.RecognitionService" />
++        </intent>
+     </queries>
+ </manifest>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/java/helium314/keyboard/keyboard/KeyboardSwitcher.kt HeliBoard-main/app/src/main/java/helium314/keyboard/keyboard/KeyboardSwitcher.kt
+--- HeliBoard-orig/app/src/main/java/helium314/keyboard/keyboard/KeyboardSwitcher.kt	2026-11-08 13:40:07.660908452 -0300
++++ HeliBoard-main/app/src/main/java/helium314/keyboard/keyboard/KeyboardSwitcher.kt	2026-11-08 22:22:18.418985668 -0300
+@@ -9,6 +9,9 @@
+ import android.content.Context
+ import android.content.res.ColorStateList
+ import android.content.res.Configuration
++import android.graphics.Bitmap
++import android.graphics.drawable.BitmapDrawable
++import android.graphics.drawable.Drawable
+ import android.inputmethodservice.InputMethodService
+ import android.os.Build
+ import android.view.ContextThemeWrapper
+@@ -37,11 +40,13 @@
+ import helium314.keyboard.latin.R
+ import helium314.keyboard.latin.RichInputMethodManager
+ import helium314.keyboard.latin.RichInputMethodSubtype
++import helium314.keyboard.latin.common.ColorType
+ import helium314.keyboard.latin.common.InsetsOutlineProvider
+ import helium314.keyboard.latin.databinding.InputViewBinding
+ import helium314.keyboard.latin.settings.Settings
+ import helium314.keyboard.latin.settings.SettingsValues
+ import helium314.keyboard.latin.settings.setFloatingKeyboardEnabled
++import helium314.keyboard.latin.utils.BackgroundBlur
+ import helium314.keyboard.latin.utils.CapsModeUtils
+ import helium314.keyboard.latin.utils.FloatingKeyboardUtils
+ import helium314.keyboard.latin.utils.FoldableUtils.isFolded
+@@ -54,6 +59,7 @@
+ import helium314.keyboard.latin.utils.dpToPx
+ import helium314.keyboard.latin.utils.prefs
+ import helium314.keyboard.latin.utils.updateSoftInputWindowLayoutParameters
++import java.lang.ref.WeakReference
+ 
+ class KeyboardSwitcher private constructor() {
+     // created in onCreateInputView (called by LatinIME before starting input), i.e. might not exist initially
+@@ -304,6 +310,7 @@
+     private fun setMainKeyboardFrame(settingsValues: SettingsValues, toggleState: KeyboardSwitchState) {
+         val inputView = inputView ?: return
+         val isGone = isImeSuppressedByHardwareKeyboard(settingsValues, toggleState)
++        setPanelBlurEnabled(voicePanelShown) // typing area: opaque background, no blur
+         inputView.stripContainer.isVisible = latinIME.hasSuggestionStripView()
+         PointerTracker.switchTo(inputView.keyboardView)
+         inputView.keyboardView.isGone = isGone
+@@ -316,8 +323,107 @@
+         inputView.suggestionStripView.isVisible = latinIME.hasSuggestionStripView()
+         clipboardHistory?.isGone = true
+         clipboardHistory?.stopClipboardHistory()
++        if (voicePanelShown && inputView.keyboardFrame.isVisible)
++            inputView.keyboardFrame.visibility = View.INVISIBLE // keep the keyboard hidden below the voice panel
+     }
+ 
++    /**
++     * Blurred keyboard background for everything that is not the typing area (emoji, clipboard, voice input).
++     * - Theme with a background image (custom image): the background of the keyboard frame is replaced by a
++     *   blurred copy of that image. Works on every Android version. The original is put back for the typing area.
++     * - Plain color theme: frosted glass, the frame background becomes translucent and the system blurs whatever
++     *   is behind the keyboard window. Needs Android 12+ and cross-window blur enabled by the system / device
++     *   (it is disabled e.g. by battery saver on some devices), otherwise the normal opaque background is kept.
++     * @return true if the background of the panel is blurred
++     */
++    fun setPanelBlurEnabled(enabled: Boolean): Boolean {
++        val inputView = inputView ?: return false
++        val frame = inputView.keyboardFrame
++        if (enabled && showBlurredImageBackground(frame)) {
++            setWindowBlurRadius(0) // the blurred image is opaque, the system blur would not be visible
++            return true
++        }
++        restoreFrameBackground(frame)
++        val blurActive = setWindowBlurRadius(if (enabled) PANEL_BLUR_RADIUS_DP.dpToPx(latinIME.resources) else 0)
++        frame.background?.mutate()?.alpha = if (blurActive) PANEL_BLUR_BACKGROUND_ALPHA else 255
++        return blurActive
++    }
++
++    /** @return true if the keyboard window is blurred by the system now (radius > 0 and the system allows it) */
++    private fun setWindowBlurRadius(radius: Int): Boolean {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
++        val window = latinIME.window?.window ?: return false
++        return try {
++            val active = radius > 0 && window.windowManager.isCrossWindowBlurEnabled
++            window.setBackgroundBlurRadius(if (active) radius else 0)
++            active
++        } catch (e: Exception) {
++            Log.w(TAG, "could not change background blur", e)
++            false
++        }
++    }
++
++    // blurred copy of the background image, see setPanelBlurEnabled
++    private var blurredFrameDrawable: BitmapDrawable? = null // while not null it is the background of the keyboard frame
++    private var originalFrameBackground: Drawable? = null
++    private var blurSourceBitmap: WeakReference<Bitmap>? = null
++    private var blurTint = 0
++    private var blurResultBitmap: Bitmap? = null
++
++    /** @return true if the frame shows the blurred copy of the background image now, false if the theme has no background image */
++    private fun showBlurredImageBackground(frame: View): Boolean {
++        val current = frame.background
++        if (current != null && current === blurredFrameDrawable) return true // already shown
++        val source = (current as? BitmapDrawable)?.bitmap ?: return false
++        val blurred = blurredBackgroundBitmap(source) ?: return false
++        val drawable = BitmapDrawable(latinIME.resources, blurred)
++        drawable.isFilterBitmap = true // the bitmap is small, it gets stretched to the size of the frame
++        originalFrameBackground = current
++        blurredFrameDrawable = drawable
++        frame.background = drawable
++        return true
++    }
++
++    private fun restoreFrameBackground(frame: View) {
++        val applied = blurredFrameDrawable ?: return
++        if (frame.background === applied) frame.background = originalFrameBackground
++        blurredFrameDrawable = null
++        originalFrameBackground = null
++    }
++
++    private fun blurredBackgroundBitmap(source: Bitmap): Bitmap? {
++        val tint = Settings.getValues().mColors.get(ColorType.MAIN_BACKGROUND)
++        val cached = blurResultBitmap
++        if (cached != null && blurSourceBitmap?.get() === source && blurTint == tint) return cached
++        val result = BackgroundBlur.blur(source, tint) ?: return null
++        blurSourceBitmap = WeakReference(source)
++        blurTint = tint
++        blurResultBitmap = result
++        return result
++    }
++
++    /** blurred copy of the background image for the voice panel, null if the theme has no background image (or blur is not shown) */
++    fun blurredPanelBackground(): Drawable? = blurredFrameDrawable?.constantState?.newDrawable(latinIME.resources)
++
++    // the voice input panel (see VoiceInputController) is a view on top of the keyboard, it hides the keyboard frame while shown
++    private var voicePanelShown = false
++
++    /** @return true if the background of the panel is blurred by the system */
++    fun setVoicePanelShown(shown: Boolean): Boolean {
++        voicePanelShown = shown
++        val inputView = inputView ?: return false
++        val frame = inputView.keyboardFrame
++        if (shown) {
++            if (frame.visibility == View.VISIBLE) frame.visibility = View.INVISIBLE // invisible, not gone, so the size stays
++        } else if (frame.visibility == View.INVISIBLE) {
++            frame.visibility = View.VISIBLE
++        }
++        return setPanelBlurEnabled(shown)
++    }
++
++    /** root view of the keyboard, only used to put the voice input panel on top of everything */
++    val inputViewRoot get() = inputView?.root
++
+     fun onToggleKeyboard(toggleState: KeyboardSwitchState) {
+         val currentState = keyboardSwitchState
+         Log.w(TAG, "onToggleKeyboard() : Current = $currentState : Toggle = $toggleState")
+@@ -573,6 +679,7 @@
+                 latinIME.currentInputEditorInfo, latinIME.mKeyboardActionListener
+             )
+             inputView.emojiPalettesView.isGone = false
++            setPanelBlurEnabled(true)
+         }
+ 
+         override fun setClipboardKeyboard() {
+@@ -594,6 +701,7 @@
+                 latinIME.currentInputEditorInfo, latinIME.mKeyboardActionListener
+             )
+             inputView.clipboardHistoryView.isGone = false
++            setPanelBlurEnabled(true)
+         }
+ 
+         override fun setNumpadKeyboard() {
+@@ -690,6 +798,8 @@
+     companion object {
+         private val TAG = KeyboardSwitcher::class.java.simpleName
+         private const val EXTENDED_TOUCHABLE_REGION_HEIGHT = 100
++        private const val PANEL_BLUR_RADIUS_DP = 28
++        private const val PANEL_BLUR_BACKGROUND_ALPHA = 175 // 0..255, how much of the theme background stays visible over the blur
+ 
+         @SuppressLint("StaticFieldLeak") // todo: actually we would want the instance to go down with LatinIME
+         private val instance = KeyboardSwitcher()
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/java/helium314/keyboard/keyboard/internal/KeyboardIconsSet.kt HeliBoard-main/app/src/main/java/helium314/keyboard/keyboard/internal/KeyboardIconsSet.kt
+--- HeliBoard-orig/app/src/main/java/helium314/keyboard/keyboard/internal/KeyboardIconsSet.kt	2026-11-08 13:40:07.662110754 -0300
++++ HeliBoard-main/app/src/main/java/helium314/keyboard/keyboard/internal/KeyboardIconsSet.kt	2026-11-08 16:30:36.246257415 -0300
+@@ -22,11 +22,12 @@
+     fun loadIcons(context: Context) {
+         val prefs = context.prefs()
+         val iconStyle = prefs.getString(Settings.PREF_ICON_STYLE, Defaults.PREF_ICON_STYLE(prefs))
++        // the modern toolbar icons replace the toolbar icons of every icon style, so they always match each other
+         val defaultIds = when (iconStyle) {
+             KeyboardTheme.STYLE_HOLO -> keyboardIconsHolo
+             KeyboardTheme.STYLE_ROUNDED -> keyboardIconsRounded
+             else -> keyboardIconsMaterial
+-        }
++        } + modernToolbarIcons
+         val overrideIds = customIconIds(context, prefs)
+         val ids = if (overrideIds.isEmpty()) defaultIds else defaultIds + overrideIds
+         if (!needsReload && ids == iconIds) return
+@@ -96,6 +97,43 @@
+             "start_onehanded_mode_key" to ToolbarKey.ONE_HANDED.name.lowercase(Locale.US),
+         )
+ 
++        // outlined icon set with one common stroke width, tinted with the theme color like all other icons
++        // (BACKGROUND_GATHERING is left out on purpose, it keeps its own icon)
++        private val modernToolbarIcons: Map<String, Int> by lazy { hashMapOf(
++            ToolbarKey.VOICE to R.drawable.ic_tb_voice,
++            ToolbarKey.CLIPBOARD to R.drawable.ic_tb_clipboard,
++            ToolbarKey.NUMPAD to R.drawable.ic_tb_numpad,
++            ToolbarKey.DPAD to R.drawable.ic_tb_dpad,
++            ToolbarKey.UNDO to R.drawable.ic_tb_undo,
++            ToolbarKey.REDO to R.drawable.ic_tb_redo,
++            ToolbarKey.SETTINGS to R.drawable.ic_tb_settings,
++            ToolbarKey.SELECT_ALL to R.drawable.ic_tb_select_all,
++            ToolbarKey.SELECT_WORD to R.drawable.ic_tb_select_word,
++            ToolbarKey.COPY to R.drawable.ic_tb_copy,
++            ToolbarKey.CUT to R.drawable.ic_tb_cut,
++            ToolbarKey.PASTE to R.drawable.ic_tb_paste,
++            ToolbarKey.ONE_HANDED to R.drawable.ic_tb_one_handed,
++            ToolbarKey.FLOATING to R.drawable.ic_tb_floating,
++            ToolbarKey.SPLIT to R.drawable.ic_tb_split,
++            ToolbarKey.INCOGNITO to R.drawable.ic_tb_incognito,
++            ToolbarKey.AUTOCORRECT to R.drawable.ic_tb_autocorrect,
++            ToolbarKey.CLEAR_CLIPBOARD to R.drawable.ic_tb_clear_clipboard,
++            ToolbarKey.CLOSE_HISTORY to R.drawable.ic_tb_close,
++            ToolbarKey.EMOJI to R.drawable.ic_tb_emoji,
++            ToolbarKey.LEFT to R.drawable.ic_tb_left,
++            ToolbarKey.RIGHT to R.drawable.ic_tb_right,
++            ToolbarKey.UP to R.drawable.ic_tb_up,
++            ToolbarKey.DOWN to R.drawable.ic_tb_down,
++            ToolbarKey.WORD_LEFT to R.drawable.ic_tb_word_left,
++            ToolbarKey.WORD_RIGHT to R.drawable.ic_tb_word_right,
++            ToolbarKey.PAGE_UP to R.drawable.ic_tb_page_up,
++            ToolbarKey.PAGE_DOWN to R.drawable.ic_tb_page_down,
++            ToolbarKey.FULL_LEFT to R.drawable.ic_tb_full_left,
++            ToolbarKey.FULL_RIGHT to R.drawable.ic_tb_full_right,
++            ToolbarKey.PAGE_START to R.drawable.ic_tb_page_start,
++            ToolbarKey.PAGE_END to R.drawable.ic_tb_page_end,
++        ).mapKeys { it.key.name.lowercase(Locale.US) } }
++
+         // todo: incognito and force incognito should not be the same? or not the same as toolbar key?
+         private val keyboardIconsHolo by lazy { hashMapOf(
+             NAME_SHIFT_KEY to                   R.drawable.sym_keyboard_shift_holo,
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/java/helium314/keyboard/latin/LatinIME.java HeliBoard-main/app/src/main/java/helium314/keyboard/latin/LatinIME.java
+--- HeliBoard-orig/app/src/main/java/helium314/keyboard/latin/LatinIME.java	2026-11-08 13:40:07.663076607 -0300
++++ HeliBoard-main/app/src/main/java/helium314/keyboard/latin/LatinIME.java	2026-11-08 16:34:46.734709554 -0300
+@@ -77,6 +77,7 @@
+ import helium314.keyboard.latin.utils.SubtypeSettings;
+ import helium314.keyboard.latin.utils.SubtypeState;
+ import helium314.keyboard.latin.utils.ToolbarMode;
++import helium314.keyboard.latin.voice.VoiceInputController;
+ import helium314.keyboard.settings.SettingsActivity2;
+ import kotlin.Unit;
+ 
+@@ -120,6 +121,8 @@
+ 
+     private RichInputMethodManager mRichImm;
+     final KeyboardSwitcher mKeyboardSwitcher;
++    // dictation inside the keyboard, instead of switching to another voice input method
++    private final VoiceInputController mVoiceInput = new VoiceInputController(this);
+     private final SubtypeState mSubtypeState = new SubtypeState((InputMethodSubtype subtype) -> { switchToSubtype(subtype); return Unit.INSTANCE; });
+     private final StatsUtilsManager mStatsUtilsManager;
+     // Working variable for {@link #startShowingInputView()} and
+@@ -614,6 +617,7 @@
+ 
+     @Override
+     public void onDestroy() {
++        mVoiceInput.hide();
+         mClipboardHistoryManager.onDestroy();
+         mDictionaryFacilitator.closeDictionaries();
+         mSettings.onDestroy();
+@@ -667,6 +671,7 @@
+ 
+     @Override
+     public View onCreateInputView() {
++        mVoiceInput.hide(); // a new input view replaces the one the voice panel was added to
+         StatsUtils.onCreateInputView();
+         return mKeyboardSwitcher.onCreateInputView(KtxKt.getDisplayContext(this), mIsHardwareAcceleratedDrawingEnabled);
+     }
+@@ -945,6 +950,7 @@
+     void onFinishInputViewInternal(final boolean finishingInput) {
+         super.onFinishInputView(finishingInput);
+         Log.i(TAG, "onFinishInputView");
++        mVoiceInput.hide();
+         cleanupInternalStateForFinishInput();
+     }
+ 
+@@ -1244,7 +1250,9 @@
+     // completely replace #onCodeInput.
+     public void onEvent(@NonNull final Event event) {
+         if (KeyCode.VOICE_INPUT == event.getKeyCode()) {
+-            mRichImm.switchToShortcutIme(this);
++            // use the built-in voice panel, and only fall back to the shortcut IME if that is not possible
++            if (!mVoiceInput.toggle())
++                mRichImm.switchToShortcutIme(this);
+         }
+         InputTransaction completeInputTransaction =
+                 mInputLogic.onCodeInput(mSettings.getCurrent(), event, mKeyboardSwitcher.getKeyboardCapsMode(), mHandler);
+@@ -1252,6 +1260,16 @@
+         mKeyboardSwitcher.onEvent(event, getCurrentAutoCapsState(), getCurrentRecapitalizeState());
+     }
+ 
++    /** Inserts text from the built-in voice input, adds a space in front if it continues a word or sentence. */
++    public void commitDictatedText(@Nullable final String text) {
++        if (text == null || text.isEmpty()) return;
++        final int codePointBefore = mInputLogic.mConnection.getCodePointBeforeCursor();
++        final boolean needsSpace = codePointBefore != Constants.NOT_A_CODE
++                && !Character.isWhitespace(codePointBefore)
++                && !Character.isWhitespace(text.codePointAt(0));
++        onTextInput(needsSpace ? " " + text : text);
++    }
++
+     public void onTextInput(@Nullable String rawText) {
+         if (rawText == null) return;
+         // TODO: have the keyboard pass the correct key code when we need it.
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/java/helium314/keyboard/latin/RichInputMethodManager.kt HeliBoard-main/app/src/main/java/helium314/keyboard/latin/RichInputMethodManager.kt
+--- HeliBoard-orig/app/src/main/java/helium314/keyboard/latin/RichInputMethodManager.kt	2026-11-08 13:40:07.663392154 -0300
++++ HeliBoard-main/app/src/main/java/helium314/keyboard/latin/RichInputMethodManager.kt	2026-11-08 16:34:56.497392598 -0300
+@@ -8,6 +8,7 @@
+ import android.content.Context
+ import android.inputmethodservice.InputMethodService
+ import android.os.Build
++import android.speech.SpeechRecognizer
+ import android.view.inputmethod.InputMethodInfo
+ import android.view.inputmethod.InputMethodManager
+ import android.view.inputmethod.InputMethodSubtype
+@@ -54,7 +55,10 @@
+ 
+     private var shortcuts = listOf<Shortcut>()
+ 
+-    val isShortcutImeReady get() = shortcuts.isNotEmpty()
++    // the built-in voice panel (see VoiceInputController) works with any speech recognition service of the device
++    private val isBuiltInVoiceAvailable get() = this::context.isInitialized && SpeechRecognizer.isRecognitionAvailable(context)
++
++    val isShortcutImeReady get() = shortcuts.isNotEmpty() || isBuiltInVoiceAvailable
+ 
+     fun getEnabledInputMethodSubtypes(imi: InputMethodInfo, allowsImplicitlySelectedSubtypes: Boolean) =
+         inputMethodInfoCache.getEnabledInputMethodSubtypeList(imi, allowsImplicitlySelectedSubtypes)
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/java/helium314/keyboard/latin/utils/BackgroundBlur.kt HeliBoard-main/app/src/main/java/helium314/keyboard/latin/utils/BackgroundBlur.kt
+--- HeliBoard-orig/app/src/main/java/helium314/keyboard/latin/utils/BackgroundBlur.kt	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/java/helium314/keyboard/latin/utils/BackgroundBlur.kt	2026-11-08 22:18:40.158634389 -0300
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: GPL-3.0-only
++package helium314.keyboard.latin.utils
++
++import android.graphics.Bitmap
++import android.graphics.Canvas
++import android.graphics.Color
++import android.graphics.Paint
++import android.graphics.Rect
++import android.os.Build
++import kotlin.math.max
++
++/** Makes a blurred, slightly tinted copy of the keyboard background image, used behind emoji, clipboard and voice panels. */
++object BackgroundBlur {
++    private val TAG = BackgroundBlur::class.java.simpleName
++    private const val DOWNSCALE = 8 // blurring a small copy is fast, and stretching it back up is smooth by itself
++    private const val RADIUS = 3 // relative to the small copy
++    private const val TINT_ALPHA = 90
++
++    /** @return a small blurred bitmap that is meant to be stretched to the size of the view, or null if something went wrong */
++    fun blur(source: Bitmap, tint: Int): Bitmap? {
++        try {
++            var readable: Bitmap? = source
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && source.config == Bitmap.Config.HARDWARE)
++                readable = source.copy(Bitmap.Config.ARGB_8888, false)
++            if (readable == null || readable.width < 1 || readable.height < 1) return null
++            val width = max(1, readable.width / DOWNSCALE)
++            val height = max(1, readable.height / DOWNSCALE)
++            val small = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
++            val canvas = Canvas(small)
++            canvas.drawBitmap(readable, null, Rect(0, 0, width, height), Paint(Paint.FILTER_BITMAP_FLAG))
++            val pixels = IntArray(width * height)
++            small.getPixels(pixels, 0, width, 0, 0, width, height)
++            PixelBlur.blur(pixels, width, height, RADIUS, 3)
++            small.setPixels(pixels, 0, width, 0, 0, width, height)
++            canvas.drawColor(Color.argb(TINT_ALPHA, Color.red(tint), Color.green(tint), Color.blue(tint)))
++            return small
++        } catch (e: Exception) {
++            Log.w(TAG, "could not blur background image", e)
++            return null
++        }
++    }
++}
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/java/helium314/keyboard/latin/utils/PixelBlur.kt HeliBoard-main/app/src/main/java/helium314/keyboard/latin/utils/PixelBlur.kt
+--- HeliBoard-orig/app/src/main/java/helium314/keyboard/latin/utils/PixelBlur.kt	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/java/helium314/keyboard/latin/utils/PixelBlur.kt	2026-11-08 22:18:40.154972694 -0300
+@@ -0,0 +1,48 @@
++// SPDX-License-Identifier: GPL-3.0-only
++package helium314.keyboard.latin.utils
++
++/**
++ * Box blur on ARGB pixels. Repeated a few times it looks like a gaussian blur.
++ * Edge pixels are repeated, so the borders don't get darker. Has no Android dependencies.
++ */
++object PixelBlur {
++    /** blurs [pixels] (row by row, [width] x [height]) in place */
++    fun blur(pixels: IntArray, width: Int, height: Int, radius: Int, passes: Int = 3) {
++        if (radius < 1 || width < 1 || height < 1 || pixels.size < width * height) return
++        val temp = IntArray(width * height)
++        repeat(passes) {
++            blurLines(pixels, temp, width, height, radius, true)
++            blurLines(temp, pixels, width, height, radius, false)
++        }
++    }
++
++    private fun blurLines(src: IntArray, dst: IntArray, width: Int, height: Int, radius: Int, horizontal: Boolean) {
++        val length = if (horizontal) width else height
++        val lines = if (horizontal) height else width
++        val step = if (horizontal) 1 else width // distance between neighbours along a line
++        val window = 2 * radius + 1
++        for (line in 0 until lines) {
++            val base = if (horizontal) line * width else line
++            var a = 0
++            var r = 0
++            var g = 0
++            var b = 0
++            for (i in -radius..radius) {
++                val p = src[base + i.coerceIn(0, length - 1) * step]
++                a += p ushr 24
++                r += (p shr 16) and 0xff
++                g += (p shr 8) and 0xff
++                b += p and 0xff
++            }
++            for (i in 0 until length) {
++                dst[base + i * step] = ((a / window) shl 24) or ((r / window) shl 16) or ((g / window) shl 8) or (b / window)
++                val outPixel = src[base + (i - radius).coerceIn(0, length - 1) * step]
++                val inPixel = src[base + (i + radius + 1).coerceIn(0, length - 1) * step]
++                a += (inPixel ushr 24) - (outPixel ushr 24)
++                r += ((inPixel shr 16) and 0xff) - ((outPixel shr 16) and 0xff)
++                g += ((inPixel shr 8) and 0xff) - ((outPixel shr 8) and 0xff)
++                b += (inPixel and 0xff) - (outPixel and 0xff)
++            }
++        }
++    }
++}
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/java/helium314/keyboard/latin/voice/VoiceInputController.kt HeliBoard-main/app/src/main/java/helium314/keyboard/latin/voice/VoiceInputController.kt
+--- HeliBoard-orig/app/src/main/java/helium314/keyboard/latin/voice/VoiceInputController.kt	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/java/helium314/keyboard/latin/voice/VoiceInputController.kt	2026-11-08 22:22:27.502986208 -0300
+@@ -0,0 +1,280 @@
++// SPDX-License-Identifier: GPL-3.0-only
++package helium314.keyboard.latin.voice
++
++import android.Manifest
++import android.content.Intent
++import android.content.pm.PackageManager
++import android.os.Build
++import android.os.Bundle
++import android.os.Handler
++import android.os.Looper
++import android.speech.RecognitionListener
++import android.speech.RecognizerIntent
++import android.speech.SpeechRecognizer
++import android.view.ViewGroup
++import android.widget.FrameLayout
++import androidx.annotation.StringRes
++import androidx.core.content.ContextCompat
++import helium314.keyboard.keyboard.KeyboardSwitcher
++import helium314.keyboard.latin.LatinIME
++import helium314.keyboard.latin.R
++import helium314.keyboard.latin.RichInputMethodManager
++import helium314.keyboard.latin.utils.Log
++import java.util.Locale
++
++/**
++ * Dictation inside the keyboard: shows a panel over the keyboard (animated bars, live text) and uses the
++ * speech recognition service of the device through [SpeechRecognizer], so the user is not sent to
++ * another voice input screen.
++ */
++class VoiceInputController(private val latinIME: LatinIME) {
++    private enum class State { OFF, IDLE, LISTENING }
++
++    private var state = State.OFF
++    private var stopRequested = false
++    private var recognizer: SpeechRecognizer? = null
++    private var view: VoiceInputView? = null
++    private var consecutiveBusyErrors = 0
++    private val handler = Handler(Looper.getMainLooper())
++
++    val isShowing get() = state != State.OFF
++
++    /**
++     * Opens or closes the voice panel.
++     * @return false if the built-in voice input can't be used, the caller should then use the old behavior
++     */
++    fun toggle(): Boolean {
++        if (isShowing) {
++            hide()
++            return true
++        }
++        if (!SpeechRecognizer.isRecognitionAvailable(latinIME)) return false
++        if (!hasPermission()) {
++            VoicePermissionActivity.start(latinIME)
++            return true
++        }
++        if (!show()) return false
++        startListening()
++        return true
++    }
++
++    fun hide() {
++        handler.removeCallbacksAndMessages(null)
++        destroyRecognizer()
++        view?.let { (it.parent as? ViewGroup)?.removeView(it) }
++        view = null
++        stopRequested = false
++        if (state != State.OFF) {
++            state = State.OFF
++            KeyboardSwitcher.getInstance().setVoicePanelShown(false)
++        }
++    }
++
++    private fun hasPermission() =
++        ContextCompat.checkSelfPermission(latinIME, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
++
++    private fun show(): Boolean {
++        val switcher = KeyboardSwitcher.getInstance()
++        val root = switcher.inputViewRoot ?: return false
++        val panel = VoiceInputView(latinIME, object : VoiceInputView.Callback {
++            override fun onCloseClicked() = hide()
++            override fun onMicClicked() = onMicButton()
++        })
++        val blurActive = switcher.setVoicePanelShown(true)
++        panel.applyTheme(blurActive, switcher.blurredPanelBackground())
++        root.addView(panel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
++        view = panel
++        state = State.IDLE
++        consecutiveBusyErrors = 0
++        return true
++    }
++
++    private fun onMicButton() {
++        when (state) {
++            State.LISTENING -> {
++                if (stopRequested) return
++                stopRequested = true
++                try {
++                    recognizer?.stopListening() // delivers what was said so far as a result
++                } catch (e: Exception) {
++                    Log.w(TAG, "stopListening failed", e)
++                    setIdle(R.string.voice_tap_to_speak)
++                    return
++                }
++                // safety net in case the recognition service never answers
++                handler.postDelayed({ if (state == State.LISTENING && stopRequested) setIdle(R.string.voice_tap_to_speak) }, STOP_TIMEOUT_MS)
++            }
++            State.IDLE -> {
++                if (!hasPermission()) {
++                    VoicePermissionActivity.start(latinIME)
++                    return
++                }
++                consecutiveBusyErrors = 0
++                startListening()
++            }
++            State.OFF -> {}
++        }
++    }
++
++    private fun createRecognizer(): SpeechRecognizer? {
++        var created: SpeechRecognizer? = null
++        try {
++            created = SpeechRecognizer.createSpeechRecognizer(latinIME)
++        } catch (e: Exception) {
++            Log.w(TAG, "could not create speech recognizer", e)
++        }
++        if (created == null) return null
++        created.setRecognitionListener(listener)
++        recognizer = created
++        return created
++    }
++
++    private fun destroyRecognizer() {
++        val current = recognizer ?: return
++        recognizer = null
++        try {
++            current.cancel()
++            current.destroy()
++        } catch (e: Exception) {
++            Log.w(TAG, "could not destroy speech recognizer", e)
++        }
++    }
++
++    private fun startListening() {
++        val panel = view ?: return
++        val rec = recognizer ?: createRecognizer()
++        if (rec == null) {
++            setIdle(R.string.voice_error_generic)
++            return
++        }
++        stopRequested = false
++        try {
++            rec.startListening(createRecognizerIntent())
++        } catch (e: Exception) {
++            Log.w(TAG, "startListening failed", e)
++            setIdle(R.string.voice_error_generic)
++            return
++        }
++        state = State.LISTENING
++        panel.setListening(true)
++        panel.setStatusText(latinIME.getString(R.string.voice_listening))
++    }
++
++    private fun setIdle(@StringRes message: Int) {
++        handler.removeCallbacksAndMessages(null)
++        stopRequested = false
++        if (state == State.OFF) return
++        state = State.IDLE
++        view?.setListening(false)
++        view?.setStatusText(latinIME.getString(message))
++    }
++
++    private fun createRecognizerIntent(): Intent {
++        val locale = recognitionLocale()
++        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
++        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
++        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, locale.toLanguageTag())
++        intent.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, latinIME.packageName)
++        intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
++        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
++        // these are only hints, the recognition service may ignore them
++        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1800L)
++        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && locale.language == "es")
++            intent.putStringArrayListExtra(RecognizerIntent.EXTRA_BIASING_STRINGS, ArrayList(SLANG_HINTS))
++        return intent
++    }
++
++    /** language of the current keyboard layout, with the region of the system language if both use the same language */
++    private fun recognitionLocale(): Locale {
++        val keyboardLocale = RichInputMethodManager.getInstance().currentSubtypeLocale
++        val systemLocale = Locale.getDefault()
++        return if (keyboardLocale.country.isEmpty() && systemLocale.language == keyboardLocale.language) systemLocale
++        else keyboardLocale
++    }
++
++    private val listener = object : RecognitionListener {
++        override fun onReadyForSpeech(params: Bundle?) {}
++
++        override fun onBeginningOfSpeech() {}
++
++        override fun onRmsChanged(rmsdB: Float) {
++            if (state == State.LISTENING) view?.setLevel(rmsdB)
++        }
++
++        override fun onBufferReceived(buffer: ByteArray?) {}
++
++        override fun onEndOfSpeech() {}
++
++        override fun onPartialResults(partialResults: Bundle?) {
++            if (state != State.LISTENING) return
++            val partial = firstResult(partialResults) ?: return
++            view?.setStatusText(partial)
++        }
++
++        override fun onResults(results: Bundle?) {
++            if (state != State.LISTENING) return
++            val text = firstResult(results)
++            if (text.isNullOrEmpty()) {
++                setIdle(R.string.voice_tap_to_speak)
++                return
++            }
++            latinIME.commitDictatedText(text)
++            if (stopRequested) {
++                setIdle(R.string.voice_tap_to_speak)
++                return
++            }
++            // keep dictating until the user stops
++            view?.setStatusText(latinIME.getString(R.string.voice_listening))
++            handler.postDelayed({ if (state == State.LISTENING && !stopRequested) startListening() }, RESTART_DELAY_MS)
++        }
++
++        override fun onError(error: Int) {
++            if (state != State.LISTENING) return
++            if (stopRequested) {
++                setIdle(R.string.voice_tap_to_speak)
++                return
++            }
++            when (error) {
++                SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT ->
++                    setIdle(R.string.voice_tap_to_speak)
++                SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> {
++                    destroyRecognizer()
++                    if (++consecutiveBusyErrors <= 2) {
++                        handler.postDelayed({ if (state == State.LISTENING) startListening() }, BUSY_RETRY_DELAY_MS)
++                    } else {
++                        setIdle(R.string.voice_error_busy)
++                    }
++                }
++                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
++                    setIdle(R.string.voice_permission_needed)
++                    VoicePermissionActivity.start(latinIME)
++                }
++                SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT, SpeechRecognizer.ERROR_SERVER ->
++                    setIdle(R.string.voice_error_network)
++                else -> {
++                    Log.w(TAG, "speech recognition error $error")
++                    setIdle(R.string.voice_error_generic)
++                }
++            }
++        }
++
++        override fun onEvent(eventType: Int, params: Bundle?) {}
++    }
++
++    private fun firstResult(bundle: Bundle?): String? =
++        bundle?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.trim()?.takeIf { it.isNotEmpty() }
++
++    companion object {
++        private val TAG = VoiceInputController::class.java.simpleName
++        private const val RESTART_DELAY_MS = 250L
++        private const val BUSY_RETRY_DELAY_MS = 400L
++        private const val STOP_TIMEOUT_MS = 4000L
++
++        // hints for the recognizer (Android 13+), spanish slang and current expressions
++        private val SLANG_HINTS = listOf(
++            "che", "boludo", "re bien", "posta", "bondi", "pibe", "mate", "meme", "memes", "brainrot", "skibidi",
++            "sigma", "mewing", "rizz", "crack", "capo", "basado", "random", "cringe", "bro", "gg", "wasap",
++        )
++    }
++}
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/java/helium314/keyboard/latin/voice/VoiceInputView.kt HeliBoard-main/app/src/main/java/helium314/keyboard/latin/voice/VoiceInputView.kt
+--- HeliBoard-orig/app/src/main/java/helium314/keyboard/latin/voice/VoiceInputView.kt	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/java/helium314/keyboard/latin/voice/VoiceInputView.kt	2026-11-08 22:22:26.822986168 -0300
+@@ -0,0 +1,139 @@
++// SPDX-License-Identifier: GPL-3.0-only
++package helium314.keyboard.latin.voice
++
++import android.content.Context
++import android.graphics.Color
++import android.graphics.drawable.Drawable
++import android.graphics.drawable.GradientDrawable
++import android.text.TextUtils
++import android.view.Gravity
++import android.view.ViewGroup
++import android.widget.FrameLayout
++import android.widget.ImageButton
++import android.widget.ImageView
++import android.widget.LinearLayout
++import android.widget.TextView
++import androidx.core.content.ContextCompat
++import androidx.core.graphics.ColorUtils
++import helium314.keyboard.latin.R
++import helium314.keyboard.latin.common.ColorType
++import helium314.keyboard.latin.settings.Settings
++import helium314.keyboard.latin.utils.dpToPx
++
++/**
++ * Voice input panel that is drawn over the keyboard: status / live text, animated bars and one big
++ * mic / stop button. All colors come from the current keyboard theme.
++ */
++class VoiceInputView(context: Context, private val callback: Callback) : FrameLayout(context) {
++    interface Callback {
++        fun onCloseClicked()
++        fun onMicClicked()
++    }
++
++    private val wave = VoiceWaveView(context)
++    private val status = TextView(context)
++    private val micButton = ImageButton(context)
++    private val closeButton = ImageButton(context)
++    private var textColor = Color.WHITE
++    private var backgroundColorOpaque = Color.BLACK
++    private var listening = false
++
++    init {
++        isClickable = true // swallow touches, so nothing reaches the keyboard below
++
++        val column = LinearLayout(context)
++        column.orientation = LinearLayout.VERTICAL
++        column.gravity = Gravity.CENTER
++
++        status.gravity = Gravity.CENTER
++        status.textSize = 17f
++        status.minLines = 2
++        status.maxLines = 2
++        status.ellipsize = TextUtils.TruncateAt.START
++        val statusParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
++        statusParams.marginStart = dp(56)
++        statusParams.marginEnd = dp(56)
++        column.addView(status, statusParams)
++
++        val waveParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44))
++        waveParams.topMargin = dp(8)
++        waveParams.marginStart = dp(32)
++        waveParams.marginEnd = dp(32)
++        column.addView(wave, waveParams)
++
++        micButton.scaleType = ImageView.ScaleType.CENTER
++        micButton.setOnClickListener { callback.onMicClicked() }
++        val micParams = LinearLayout.LayoutParams(dp(60), dp(60))
++        micParams.topMargin = dp(12)
++        column.addView(micButton, micParams)
++
++        addView(column, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
++
++        closeButton.background = null
++        closeButton.scaleType = ImageView.ScaleType.CENTER
++        closeButton.contentDescription = context.getString(R.string.voice_close)
++        closeButton.setOnClickListener { callback.onCloseClicked() }
++        val closeParams = FrameLayout.LayoutParams(dp(48), dp(48), Gravity.TOP or Gravity.END)
++        closeParams.setMargins(dp(4), dp(4), dp(4), dp(4))
++        addView(closeButton, closeParams)
++
++        applyTheme(false)
++        setListening(false)
++    }
++
++    private fun dp(value: Int) = value.dpToPx(resources)
++
++    /**
++     * @param blurActive true if the system blurs what is behind the keyboard, so the panel can be translucent
++     * @param blurredImage blurred copy of the keyboard background image (custom background), if the theme has one
++     */
++    fun applyTheme(blurActive: Boolean, blurredImage: Drawable? = null) {
++        val colors = Settings.getValues().mColors
++        backgroundColorOpaque = ColorUtils.setAlphaComponent(colors.get(ColorType.MAIN_BACKGROUND), 255)
++        textColor = ColorUtils.setAlphaComponent(colors.get(ColorType.KEY_TEXT), 255)
++        if (blurredImage != null) background = blurredImage
++        else setBackgroundColor(if (blurActive) ColorUtils.setAlphaComponent(backgroundColorOpaque, 0xB0) else backgroundColorOpaque)
++        status.setTextColor(textColor)
++        wave.setColor(textColor)
++        val circle = GradientDrawable()
++        circle.shape = GradientDrawable.OVAL
++        circle.setColor(textColor)
++        micButton.background = circle
++        val closeIcon = ContextCompat.getDrawable(context, R.drawable.ic_tb_close)?.mutate()
++        closeIcon?.setTint(textColor)
++        closeButton.setImageDrawable(closeIcon)
++        updateMicIcon()
++    }
++
++    private fun updateMicIcon() {
++        val icon = ContextCompat.getDrawable(context, if (listening) R.drawable.ic_tb_stop else R.drawable.ic_tb_voice)?.mutate()
++        icon?.setTint(backgroundColorOpaque) // inverse of the button color
++        micButton.setImageDrawable(icon)
++        micButton.contentDescription = context.getString(if (listening) R.string.voice_stop else R.string.voice_start)
++    }
++
++    fun setListening(isListening: Boolean) {
++        listening = isListening
++        wave.setListening(isListening)
++        if (!isListening) {
++            micButton.scaleX = 1f
++            micButton.scaleY = 1f
++        }
++        updateMicIcon()
++    }
++
++    fun setStatusText(text: CharSequence) {
++        status.text = text
++    }
++
++    /** @param rmsDb value from RecognitionListener.onRmsChanged (roughly -2 to 10) */
++    fun setLevel(rmsDb: Float) {
++        val level = ((rmsDb + 2f) / 12f).coerceIn(0f, 1f)
++        wave.setLevel(level)
++        if (listening) {
++            val scale = 1f + 0.12f * level
++            micButton.scaleX = scale
++            micButton.scaleY = scale
++        }
++    }
++}
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/java/helium314/keyboard/latin/voice/VoicePermissionActivity.kt HeliBoard-main/app/src/main/java/helium314/keyboard/latin/voice/VoicePermissionActivity.kt
+--- HeliBoard-orig/app/src/main/java/helium314/keyboard/latin/voice/VoicePermissionActivity.kt	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/java/helium314/keyboard/latin/voice/VoicePermissionActivity.kt	2026-11-08 16:33:45.361972547 -0300
+@@ -0,0 +1,41 @@
++// SPDX-License-Identifier: GPL-3.0-only
++package helium314.keyboard.latin.voice
++
++import android.Manifest
++import android.app.Activity
++import android.content.Context
++import android.content.Intent
++import android.content.pm.PackageManager
++import android.os.Bundle
++import android.widget.Toast
++import androidx.core.app.ActivityCompat
++import helium314.keyboard.latin.R
++
++/** Transparent activity: an input method cannot ask for runtime permissions itself. */
++class VoicePermissionActivity : Activity() {
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
++        if (savedInstanceState == null) {
++            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_CODE)
++        }
++    }
++
++    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
++        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
++        if (requestCode == REQUEST_CODE) {
++            val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
++            Toast.makeText(this, if (granted) R.string.voice_permission_granted else R.string.voice_permission_denied, Toast.LENGTH_LONG).show()
++        }
++        finish()
++    }
++
++    companion object {
++        private const val REQUEST_CODE = 1
++
++        fun start(context: Context) {
++            val intent = Intent(context, VoicePermissionActivity::class.java)
++            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++            context.startActivity(intent)
++        }
++    }
++}
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/java/helium314/keyboard/latin/voice/VoiceWaveView.kt HeliBoard-main/app/src/main/java/helium314/keyboard/latin/voice/VoiceWaveView.kt
+--- HeliBoard-orig/app/src/main/java/helium314/keyboard/latin/voice/VoiceWaveView.kt	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/java/helium314/keyboard/latin/voice/VoiceWaveView.kt	2026-11-08 16:33:45.359802913 -0300
+@@ -0,0 +1,98 @@
++// SPDX-License-Identifier: GPL-3.0-only
++package helium314.keyboard.latin.voice
++
++import android.content.Context
++import android.graphics.Canvas
++import android.graphics.Paint
++import android.graphics.RectF
++import android.view.View
++import kotlin.math.exp
++import kotlin.math.sin
++
++/**
++ * Animated "voice bars". Reacts to the microphone level while listening and breathes slowly while idle.
++ * Driven by the display frame callback (not by ValueAnimator), so it keeps moving even if the user
++ * has turned off system animations.
++ */
++class VoiceWaveView(context: Context) : View(context) {
++    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
++    private val rect = RectF()
++    private var level = 0f // smoothed, 0..1
++    private var targetLevel = 0f
++    private var phase = 0f
++    private var listening = false
++    private var lastFrameNanos = 0L
++    private var running = false
++
++    private val ticker = object : Runnable {
++        override fun run() {
++            if (!running) return
++            advance()
++            invalidate()
++            postOnAnimation(this)
++        }
++    }
++
++    fun setColor(color: Int) {
++        paint.color = color
++        invalidate()
++    }
++
++    fun setListening(on: Boolean) {
++        listening = on
++        if (!on) targetLevel = 0f
++    }
++
++    /** level between 0 and 1 */
++    fun setLevel(newLevel: Float) {
++        targetLevel = newLevel.coerceIn(0f, 1f)
++    }
++
++    override fun onAttachedToWindow() {
++        super.onAttachedToWindow()
++        running = true
++        lastFrameNanos = 0L
++        postOnAnimation(ticker)
++    }
++
++    override fun onDetachedFromWindow() {
++        running = false
++        removeCallbacks(ticker)
++        super.onDetachedFromWindow()
++    }
++
++    private fun advance() {
++        val now = System.nanoTime()
++        val dt = if (lastFrameNanos == 0L) 0.016f else ((now - lastFrameNanos) / 1_000_000_000f).coerceAtMost(0.05f)
++        lastFrameNanos = now
++        val target = if (listening) targetLevel else 0f
++        val speed = if (target > level) 18f else 5f // quick to rise, slow to fall
++        level += (target - level) * (1f - exp(-speed * dt))
++        phase += dt * if (listening) 7f else 1.6f
++    }
++
++    override fun onDraw(canvas: Canvas) {
++        val w = width.toFloat()
++        val h = height.toFloat()
++        if (w <= 0f || h <= 0f) return
++        val slot = w / BAR_COUNT
++        val barWidth = slot * 0.52f
++        val minHeight = barWidth
++        val half = (BAR_COUNT - 1) / 2f
++        val amplitude = if (listening) 0.12f + level * 0.88f else 0.10f
++        for (i in 0 until BAR_COUNT) {
++            val x = i * slot + slot / 2f
++            val pos = (i - half) / half // -1..1
++            val envelope = 1f - 0.65f * pos * pos // taller in the middle
++            val wobble = 0.5f + 0.5f * sin(phase + i * 0.62f)
++            val barHeight = (minHeight + (h - minHeight) * envelope * amplitude * (0.35f + 0.65f * wobble))
++                .coerceIn(minHeight, h)
++            rect.set(x - barWidth / 2f, (h - barHeight) / 2f, x + barWidth / 2f, (h + barHeight) / 2f)
++            canvas.drawRoundRect(rect, barWidth / 2f, barWidth / 2f, paint)
++        }
++    }
++
++    companion object {
++        private const val BAR_COUNT = 29
++    }
++}
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_autocorrect.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_autocorrect.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_autocorrect.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_autocorrect.xml	2026-11-08 13:45:43.294261352 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M4,17l5,-12l5,12M5.8,13h6.4M15.5,19.5l2.5,2.5l4.5,-5"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_clear_clipboard.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_clear_clipboard.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_clear_clipboard.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_clear_clipboard.xml	2026-11-08 13:45:43.294110098 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M4,7h16M18.5,7l-0.8,12a2,2 0 0 1 -2,1.9H8.3a2,2 0 0 1 -2,-1.9L5.5,7M9,7V5a1.5,1.5 0 0 1 1.5,-1.5h3A1.5,1.5 0 0 1 15,5v2M10,11L10,16M14,11L14,16"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_clipboard.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_clipboard.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_clipboard.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_clipboard.xml	2026-11-08 13:45:43.293938839 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M7.5,4h9a2.5,2.5 0 0 1 2.5,2.5v12.5a2.5,2.5 0 0 1 -2.5,2.5h-9a2.5,2.5 0 0 1 -2.5,-2.5v-12.5a2.5,2.5 0 0 1 2.5,-2.5zM10,2h4a1.5,1.5 0 0 1 1.5,1.5v1a1.5,1.5 0 0 1 -1.5,1.5h-4a1.5,1.5 0 0 1 -1.5,-1.5v-1a1.5,1.5 0 0 1 1.5,-1.5zM9,11L15,11M9,15L15,15"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_close.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_close.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_close.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_close.xml	2026-11-08 13:45:43.294128413 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M6,6L18,18M18,6L6,18"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_copy.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_copy.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_copy.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_copy.xml	2026-11-08 13:45:43.293979026 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M11.5,9h7a2.5,2.5 0 0 1 2.5,2.5v7a2.5,2.5 0 0 1 -2.5,2.5h-7a2.5,2.5 0 0 1 -2.5,-2.5v-7a2.5,2.5 0 0 1 2.5,-2.5zM5.5,15h-0.5a2,2 0 0 1 -2,-2v-8a2,2 0 0 1 2,-2h8a2,2 0 0 1 2,2v0.5"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_cut.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_cut.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_cut.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_cut.xml	2026-11-08 13:45:43.293996540 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M3.2,6.5a2.8,2.8 0 1 0 5.6,0a2.8,2.8 0 1 0 -5.6,0zM3.2,17.5a2.8,2.8 0 1 0 5.6,0a2.8,2.8 0 1 0 -5.6,0zM20,4L8.3,15.4M14.6,14.6L20,20M8.3,8.6L12,12.2"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_down.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_down.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_down.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_down.xml	2026-11-08 13:45:43.294354342 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M5.5,9.5l6.5,6.5l6.5,-6.5"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_dpad.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_dpad.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_dpad.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_dpad.xml	2026-11-08 13:45:43.294203385 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M12,2.5v19M2.5,12h19M9,5.5l3,-3l3,3M9,18.5l3,3l3,-3M5.5,9l-3,3l3,3M18.5,9l3,3l-3,3"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_emoji.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_emoji.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_emoji.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_emoji.xml	2026-11-08 13:45:43.294175191 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M2.5,12a9.5,9.5 0 1 0 19,0a9.5,9.5 0 1 0 -19,0zM8,14.2s1.5,2.3 4,2.3s4,-2.3 4,-2.3M9,9.5h0.01M15,9.5h0.01"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_floating.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_floating.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_floating.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_floating.xml	2026-11-08 13:45:43.294232741 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M21,10V6.5a2,2 0 0 0 -2,-2H5a2,2 0 0 0 -2,2v10a2,2 0 0 0 2,2h4M14,13h5.5a1.5,1.5 0 0 1 1.5,1.5v3.5a1.5,1.5 0 0 1 -1.5,1.5h-5.5a1.5,1.5 0 0 1 -1.5,-1.5v-3.5a1.5,1.5 0 0 1 1.5,-1.5z"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_full_left.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_full_left.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_full_left.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_full_left.xml	2026-11-08 13:45:43.294426195 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M4,5L4,19M20,12H8M12.5,7l-5,5l5,5"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_full_right.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_full_right.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_full_right.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_full_right.xml	2026-11-08 13:45:43.294440110 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M20,5L20,19M4,12h12M11.5,7l5,5l-5,5"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_incognito.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_incognito.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_incognito.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_incognito.xml	2026-11-08 13:45:43.294160233 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M3,12h18M5.5,12l1.6,-6.2A2,2 0 0 1 9,4.3h6a2,2 0 0 1 1.9,1.5L18.5,12M4.8,17a2.7,2.7 0 1 0 5.4,0a2.7,2.7 0 1 0 -5.4,0zM13.8,17a2.7,2.7 0 1 0 5.4,0a2.7,2.7 0 1 0 -5.4,0zM10.2,16.6a2,2 0 0 1 3.6,0"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_left.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_left.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_left.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_left.xml	2026-11-08 13:45:43.294309831 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M14.5,5.5l-6.5,6.5l6.5,6.5"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_numpad.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_numpad.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_numpad.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_numpad.xml	2026-11-08 13:45:43.294189071 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M6.5,3.5h11a3,3 0 0 1 3,3v11a3,3 0 0 1 -3,3h-11a3,3 0 0 1 -3,-3v-11a3,3 0 0 1 3,-3zM3.5,9.2L20.5,9.2M3.5,14.8L20.5,14.8M9.2,3.5L9.2,20.5M14.8,3.5L14.8,20.5"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_one_handed.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_one_handed.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_one_handed.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_one_handed.xml	2026-11-08 13:45:43.294218576 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M9,2.5h6a3,3 0 0 1 3,3v13a3,3 0 0 1 -3,3h-6a3,3 0 0 1 -3,-3v-13a3,3 0 0 1 3,-3zM12,18h0.01"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_page_down.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_page_down.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_page_down.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_page_down.xml	2026-11-08 13:45:43.294411326 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M6,12l6,6l6,-6M6,5l6,6l6,-6"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_page_end.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_page_end.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_page_end.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_page_end.xml	2026-11-08 13:45:43.294500460 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M5,20L19,20M12,4v12M6.5,11.5l5.5,5.5l5.5,-5.5"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_page_start.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_page_start.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_page_start.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_page_start.xml	2026-11-08 13:45:43.294453696 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M5,4L19,4M12,20V8M6.5,12.5l5.5,-5.5l5.5,5.5"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_page_up.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_page_up.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_page_up.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_page_up.xml	2026-11-08 13:45:43.294397626 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M6,12l6,-6l6,6M6,19l6,-6l6,6"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_paste.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_paste.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_paste.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_paste.xml	2026-11-08 13:45:43.293961786 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M7.5,4h9a2.5,2.5 0 0 1 2.5,2.5v12.5a2.5,2.5 0 0 1 -2.5,2.5h-9a2.5,2.5 0 0 1 -2.5,-2.5v-12.5a2.5,2.5 0 0 1 2.5,-2.5zM10,2h4a1.5,1.5 0 0 1 1.5,1.5v1a1.5,1.5 0 0 1 -1.5,1.5h-4a1.5,1.5 0 0 1 -1.5,-1.5v-1a1.5,1.5 0 0 1 1.5,-1.5zM12,10.5L12,17M9,14.5l3,3l3,-3"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_redo.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_redo.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_redo.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_redo.xml	2026-11-08 13:45:43.294033364 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M15,14l5,-5l-5,-5M20,9H9.5a5.5,5.5 0 0 0 0,11H13"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_right.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_right.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_right.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_right.xml	2026-11-08 13:45:43.294326708 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M9.5,5.5l6.5,6.5l-6.5,6.5"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_select_all.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_select_all.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_select_all.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_select_all.xml	2026-11-08 13:45:43.294063782 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M5,3a2,2 0 0 0 -2,2M19,3a2,2 0 0 1 2,2M21,19a2,2 0 0 1 -2,2M5,21a2,2 0 0 1 -2,-2M9,3h1M14,3h1M9,21h1M14,21h1M3,9v1M3,14v1M21,9v1M21,14v1M9.5,8h5a1.5,1.5 0 0 1 1.5,1.5v5a1.5,1.5 0 0 1 -1.5,1.5h-5a1.5,1.5 0 0 1 -1.5,-1.5v-5a1.5,1.5 0 0 1 1.5,-1.5z"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_select_word.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_select_word.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_select_word.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_select_word.xml	2026-11-08 13:45:43.294048473 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M5,3a2,2 0 0 0 -2,2M19,3a2,2 0 0 1 2,2M21,19a2,2 0 0 1 -2,2M5,21a2,2 0 0 1 -2,-2M9,3h1M14,3h1M9,21h1M14,21h1M3,9v1M3,14v1M21,9v1M21,14v1M7.5,8.5L15.5,8.5M7.5,12L16.5,12M7.5,15.5L13,15.5"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_settings.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_settings.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_settings.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_settings.xml	2026-11-08 13:45:43.294143294 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M9.96,5.41L10.43,2.83L13.57,2.83L14.04,5.41A6.9,6.9 0 0 1 15.22,5.9L17.37,4.41L19.59,6.63L18.1,8.78A6.9,6.9 0 0 1 18.59,9.96L21.17,10.43L21.17,13.57L18.59,14.04A6.9,6.9 0 0 1 18.1,15.22L19.59,17.37L17.37,19.59L15.22,18.1A6.9,6.9 0 0 1 14.04,18.59L13.57,21.17L10.43,21.17L9.96,18.59A6.9,6.9 0 0 1 8.78,18.1L6.63,19.59L4.41,17.37L5.9,15.22A6.9,6.9 0 0 1 5.41,14.04L2.83,13.57L2.83,10.43L5.41,9.96A6.9,6.9 0 0 1 5.9,8.78L4.41,6.63L6.63,4.41L8.78,5.9A6.9,6.9 0 0 1 9.96,5.41zM9.1,12a2.9,2.9 0 1 0 5.8,0a2.9,2.9 0 1 0 -5.8,0z"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_split.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_split.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_split.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_split.xml	2026-11-08 13:45:43.294247320 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M6,5h12a3,3 0 0 1 3,3v8a3,3 0 0 1 -3,3h-12a3,3 0 0 1 -3,-3v-8a3,3 0 0 1 3,-3zM12,5L12,19"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_stop.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_stop.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_stop.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_stop.xml	2026-11-08 13:45:43.294516644 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M9.5,6.5h5a3,3 0 0 1 3,3v5a3,3 0 0 1 -3,3h-5a3,3 0 0 1 -3,-3v-5a3,3 0 0 1 3,-3z"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_undo.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_undo.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_undo.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_undo.xml	2026-11-08 13:45:43.294013488 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M9,14l-5,-5l5,-5M4,9h10.5a5.5,5.5 0 0 1 0,11H11"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_up.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_up.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_up.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_up.xml	2026-11-08 13:45:43.294340743 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M5.5,14.5l6.5,-6.5l6.5,6.5"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_voice.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_voice.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_voice.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_voice.xml	2026-11-08 13:45:43.290945371 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M12,2.5h0a3,3 0 0 1 3,3v6a3,3 0 0 1 -3,3h0a3,3 0 0 1 -3,-3v-6a3,3 0 0 1 3,-3zM5.5,11v1a6.5,6.5 0 0 0 13,0v-1M12,18.5v3M8.5,21.5h7"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_word_left.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_word_left.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_word_left.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_word_left.xml	2026-11-08 13:45:43.294368220 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M12,6l-6,6l6,6M19,6l-6,6l6,6"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/drawable/ic_tb_word_right.xml HeliBoard-main/app/src/main/res/drawable/ic_tb_word_right.xml
+--- HeliBoard-orig/app/src/main/res/drawable/ic_tb_word_right.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/drawable/ic_tb_word_right.xml	2026-11-08 13:45:43.294384169 -0300
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++    SPDX-License-Identifier: GPL-3.0-only
++    Modern outlined toolbar icon set: 24dp grid, 2dp round stroke. Drawn for this project in the
++    general style of common open line-icon sets; no third-party artwork is copied.
++    The stroke is white on purpose: it is tinted with the keyboard theme color at runtime.
++-->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M12,6l6,6l-6,6M5,6l6,6l-6,6"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="2"
++        android:strokeLineCap="round"
++        android:strokeLineJoin="round" />
++</vector>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/values/config-common.xml HeliBoard-main/app/src/main/res/values/config-common.xml
+--- HeliBoard-orig/app/src/main/res/values/config-common.xml	2026-11-08 13:40:07.694588483 -0300
++++ HeliBoard-main/app/src/main/res/values/config-common.xml	2026-11-08 13:44:52.322942342 -0300
+@@ -57,7 +57,9 @@
+     <integer name="config_keyboard_grid_width">32</integer>
+     <integer name="config_keyboard_grid_height">16</integer>
+     <dimen name="config_touch_noise_threshold_distance">12.6dp</dimen>
+-    <integer name="config_touch_noise_threshold_time">40</integer>
++    <!-- 0 disables the "ignore a tap that comes right after another one close to it" noise filter.
++         With the stock value (40 ms) quick successive taps could be silently dropped. -->
++    <integer name="config_touch_noise_threshold_time">0</integer>
+ 
+     <!-- Common keyboard configuration. -->
+     <fraction name="config_keyboard_left_padding">8%p</fraction>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/values/strings-voice.xml HeliBoard-main/app/src/main/res/values/strings-voice.xml
+--- HeliBoard-orig/app/src/main/res/values/strings-voice.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/values/strings-voice.xml	2026-11-08 16:35:00.852137461 -0300
+@@ -0,0 +1,15 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- SPDX-License-Identifier: GPL-3.0-only -->
++<resources>
++    <string name="voice_listening">Listening…</string>
++    <string name="voice_tap_to_speak">Tap the microphone to speak</string>
++    <string name="voice_close">Close voice input</string>
++    <string name="voice_start">Start dictation</string>
++    <string name="voice_stop">Stop dictation</string>
++    <string name="voice_permission_needed">Microphone access is needed to dictate</string>
++    <string name="voice_permission_granted">Microphone allowed. Tap the microphone key again.</string>
++    <string name="voice_permission_denied">Microphone permission denied</string>
++    <string name="voice_error_network">The speech service has no connection</string>
++    <string name="voice_error_busy">The speech service is busy, try again</string>
++    <string name="voice_error_generic">Could not understand, tap the microphone to try again</string>
++</resources>
+diff -ruN -x build -x .gradle -x .git HeliBoard-orig/app/src/main/res/values-es/strings-voice.xml HeliBoard-main/app/src/main/res/values-es/strings-voice.xml
+--- HeliBoard-orig/app/src/main/res/values-es/strings-voice.xml	1969-12-31 21:00:00.000000000 -0300
++++ HeliBoard-main/app/src/main/res/values-es/strings-voice.xml	2026-11-08 16:35:00.854224087 -0300
+@@ -0,0 +1,15 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- SPDX-License-Identifier: GPL-3.0-only -->
++<resources>
++    <string name="voice_listening">Escuchando…</string>
++    <string name="voice_tap_to_speak">Tocá el micrófono para hablar</string>
++    <string name="voice_close">Cerrar dictado por voz</string>
++    <string name="voice_start">Empezar a dictar</string>
++    <string name="voice_stop">Dejar de dictar</string>
++    <string name="voice_permission_needed">Hace falta el permiso del micrófono para dictar</string>
++    <string name="voice_permission_granted">Micrófono permitido. Tocá de nuevo la tecla del micrófono.</string>
++    <string name="voice_permission_denied">Permiso del micrófono denegado</string>
++    <string name="voice_error_network">El servicio de voz no tiene conexión</string>
++    <string name="voice_error_busy">El servicio de voz está ocupado, probá de nuevo</string>
++    <string name="voice_error_generic">No se entendió, tocá el micrófono para reintentar</string>
++</resources>
